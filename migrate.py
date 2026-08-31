@@ -45,7 +45,7 @@ def mysql_conn():
     )
 
 
-def ensure_mysql_table(cur):
+def ensure_mysql_tables(cur):
     cur.execute("""
         CREATE TABLE IF NOT EXISTS extracted_data (
             id         INT AUTO_INCREMENT PRIMARY KEY,
@@ -56,6 +56,74 @@ def ensure_mysql_table(cur):
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS validated_urls (
+            id            INT AUTO_INCREMENT PRIMARY KEY,
+            url           TEXT          NOT NULL,
+            status_code   INT,
+            response_time FLOAT,
+            content_type  TEXT          DEFAULT '',
+            server        TEXT          DEFAULT '',
+            redirect_url  TEXT          DEFAULT '',
+            checked_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS not_validated_urls (
+            id            INT AUTO_INCREMENT PRIMARY KEY,
+            url           TEXT          NOT NULL,
+            error_message TEXT          DEFAULT '',
+            status_code   INT,
+            checked_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """)
+
+
+def _migrate_table(pg, my, table, pg_columns, mysql_insert_sql, row_to_values):
+    col_list = ", ".join(pg_columns)
+
+    with pg.cursor() as pg_cur:
+        pg_cur.execute(f"SELECT COUNT(*) AS total FROM {table}")
+        total = pg_cur.fetchone()["total"]
+        print(f"[{table}] Found {total} rows in PostgreSQL")
+
+        if total == 0:
+            return
+
+        pg_cur.execute(f"SELECT {col_list} FROM {table} ORDER BY id")
+        rows = pg_cur.fetchall()
+
+    with my.cursor() as my_cur:
+        my_cur.execute(f"SELECT id FROM {table}")
+        existing_ids = {r["id"] for r in my_cur.fetchall()}
+
+    new_rows = [r for r in rows if r["id"] not in existing_ids]
+    skipped  = len(rows) - len(new_rows)
+    inserted = 0
+    deleted  = 0
+
+    CHUNK_SIZE = 500
+    for offset in range(0, len(new_rows), CHUNK_SIZE):
+        chunk = new_rows[offset : offset + CHUNK_SIZE]
+        chunk_ids = [row["id"] for row in chunk]
+
+        values = [row_to_values(row) for row in chunk]
+        with my.cursor() as my_cur:
+            my_cur.executemany(mysql_insert_sql, values)
+        my.commit()
+        inserted += len(chunk)
+        print(f"  [{table}] Migrated {inserted}/{len(new_rows)} rows to MySQL...")
+
+        with pg.cursor() as pg_cur:
+            pg_cur.execute(
+                f"DELETE FROM {table} WHERE id = ANY(%s)",
+                (chunk_ids,),
+            )
+            pg.commit()
+            deleted += pg_cur.rowcount
+        print(f"  [{table}] Deleted {deleted} rows from Railway so far...")
+
+    print(f"[{table}] Done — {inserted} inserted, {skipped} skipped, {deleted} deleted from Railway")
 
 
 def migrate():
@@ -65,70 +133,72 @@ def migrate():
     print("Connecting to MySQL...")
     my = mysql_conn()
 
-    with pg.cursor() as pg_cur:
-        pg_cur.execute("SELECT COUNT(*) AS total FROM extracted_data")
-        total = pg_cur.fetchone()["total"]
-        print(f"Found {total} rows in PostgreSQL")
-
-        pg_cur.execute(
-            "SELECT id, name, emails, phones, urls, created_at FROM extracted_data ORDER BY id"
-        )
-        rows = pg_cur.fetchall()
-
-    CHUNK_SIZE = 500
-
     with my.cursor() as my_cur:
-        ensure_mysql_table(my_cur)
-        my_cur.execute("SELECT id FROM extracted_data")
-        existing_ids = {r["id"] for r in my_cur.fetchall()}
+        ensure_mysql_tables(my_cur)
+    my.commit()
 
-    new_rows = [r for r in rows if r["id"] not in existing_ids]
-    skipped  = len(rows) - len(new_rows)
-    inserted = 0
-    deleted  = 0
+    # ── extracted_data ────────────────────────────────────────────────────
+    _migrate_table(
+        pg, my,
+        table="extracted_data",
+        pg_columns=["id", "name", "emails", "phones", "urls", "created_at"],
+        mysql_insert_sql="""
+            INSERT INTO extracted_data (id, name, emails, phones, urls, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        row_to_values=lambda r: (
+            r["id"],
+            r["name"],
+            json.dumps(r["emails"] or []),
+            json.dumps(r["phones"] or []),
+            json.dumps(r["urls"]   or []),
+            r["created_at"],
+        ),
+    )
 
-    for offset in range(0, len(new_rows), CHUNK_SIZE):
-        chunk = new_rows[offset : offset + CHUNK_SIZE]
-        chunk_ids = [row["id"] for row in chunk]
+    # ── validated_urls ────────────────────────────────────────────────────
+    _migrate_table(
+        pg, my,
+        table="validated_urls",
+        pg_columns=["id", "url", "status_code", "response_time", "content_type", "server", "redirect_url", "checked_at"],
+        mysql_insert_sql="""
+            INSERT INTO validated_urls (id, url, status_code, response_time, content_type, server, redirect_url, checked_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        row_to_values=lambda r: (
+            r["id"],
+            r["url"],
+            r["status_code"],
+            r["response_time"],
+            r["content_type"] or "",
+            r["server"] or "",
+            r["redirect_url"] or "",
+            r["checked_at"],
+        ),
+    )
 
-        # ── Step 1: insert chunk into MySQL ───────────────────────────────
-        values = [
-            (
-                row["id"],
-                row["name"],
-                json.dumps(row["emails"] or []),
-                json.dumps(row["phones"] or []),
-                json.dumps(row["urls"]   or []),
-                row["created_at"],
-            )
-            for row in chunk
-        ]
-        with my.cursor() as my_cur:
-            my_cur.executemany(
-                """
-                INSERT INTO extracted_data (id, name, emails, phones, urls, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                values,
-            )
-        my.commit()
-        inserted += len(chunk)
-        print(f"  Migrated {inserted}/{len(new_rows)} rows to MySQL...")
-
-        # ── Step 2: delete that same chunk from Railway PostgreSQL ────────
-        with pg.cursor() as pg_cur:
-            pg_cur.execute(
-                "DELETE FROM extracted_data WHERE id = ANY(%s)",
-                (chunk_ids,),
-            )
-            pg.commit()
-            deleted += pg_cur.rowcount
-        print(f"  Deleted {deleted} rows from Railway so far...")
+    # ── not_validated_urls ────────────────────────────────────────────────
+    _migrate_table(
+        pg, my,
+        table="not_validated_urls",
+        pg_columns=["id", "url", "error_message", "status_code", "checked_at"],
+        mysql_insert_sql="""
+            INSERT INTO not_validated_urls (id, url, error_message, status_code, checked_at)
+            VALUES (%s, %s, %s, %s, %s)
+        """,
+        row_to_values=lambda r: (
+            r["id"],
+            r["url"],
+            r["error_message"] or "",
+            r["status_code"],
+            r["checked_at"],
+        ),
+    )
 
     pg.close()
     my.close()
 
-    print(f"Done — {inserted} inserted, {skipped} skipped, {deleted} deleted from Railway")
+    print("All tables migrated successfully.")
 
 
 if __name__ == "__main__":
