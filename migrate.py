@@ -77,6 +77,27 @@ def ensure_mysql_tables(cur):
             checked_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS lead_cards (
+            id             INT AUTO_INCREMENT PRIMARY KEY,
+            domain         TEXT          NOT NULL,
+            company_name   TEXT          NOT NULL DEFAULT '',
+            business_type  TEXT          NOT NULL DEFAULT 'Unknown',
+            secondary_type TEXT          NOT NULL DEFAULT '',
+            confidence     FLOAT         NOT NULL DEFAULT 0,
+            industry       TEXT          NOT NULL DEFAULT '',
+            offerings      JSON,
+            description    TEXT          NOT NULL DEFAULT '',
+            emails         JSON,
+            phones         JSON,
+            social_links   JSON,
+            addresses      JSON,
+            tech_stack     JSON,
+            pages_crawled  INT           NOT NULL DEFAULT 0,
+            status         TEXT          NOT NULL DEFAULT 'success',
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """)
 
 
 def _migrate_table(pg, my, table, pg_columns, mysql_insert_sql, row_to_values):
@@ -192,6 +213,45 @@ def migrate():
             r["error_message"] or "",
             r["status_code"],
             r["checked_at"],
+        ),
+    )
+
+    # ── lead_cards ─────────────────────────────────────────────────────
+    _migrate_table(
+        pg, my,
+        table="lead_cards",
+        pg_columns=[
+            "id", "domain", "company_name", "business_type", "secondary_type",
+            "confidence", "industry", "offerings", "description",
+            "emails", "phones", "social_links", "addresses", "tech_stack",
+            "pages_crawled", "status", "created_at",
+        ],
+        mysql_insert_sql="""
+            INSERT INTO lead_cards
+                (id, domain, company_name, business_type, secondary_type,
+                 confidence, industry, offerings, description,
+                 emails, phones, social_links, addresses, tech_stack,
+                 pages_crawled, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        row_to_values=lambda r: (
+            r["id"],
+            r["domain"],
+            r["company_name"] or "",
+            r["business_type"] or "Unknown",
+            r["secondary_type"] or "",
+            r["confidence"] or 0,
+            r["industry"] or "",
+            json.dumps(r["offerings"] or []),
+            r["description"] or "",
+            json.dumps(r["emails"] or []),
+            json.dumps(r["phones"] or []),
+            json.dumps(r["social_links"] if r["social_links"] else {}),
+            json.dumps(r["addresses"] or []),
+            json.dumps(r["tech_stack"] or []),
+            r["pages_crawled"] or 0,
+            r["status"] or "success",
+            r["created_at"],
         ),
     )
 
